@@ -572,13 +572,14 @@ j1939_status_t j1939_delete(j1939_t *self) {
 
 j1939_status_t j1939_transmit(j1939_t *self, const j1939_message_t *msg, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  if (self->status != J1939_TP_READY)
+  if (self->status >= J1939_TP_COMPLETE_RX /*!= J1939_TP_READY*/)
     res = J1939_BUSY;
   else if (msg->size > J1939_TP_MAX_MSG_SIZE)
     res = J1939_ERROR;
   else if (msg->size > J1939_SIZE_DATAFIELD) {
     self->lmsg = (j1939_message_t *)msg;
     self->total_packets = get_total_packets(msg->size);
+    self->packets_count = 0;
     if (msg->pdu.pdu_format < J1939_ADDRESS_DIVIDE)
       res = j1939_tp_cm_rts_transmit_manager(self, timeout_ms);
     else
@@ -615,3 +616,4 @@ j1939_status_t j1939_receive(j1939_t *self, uint32_t timeout_ms) {
 j1939_status_t j1939_status(j1939_t *self) {
   return (self->status == J1939_TP_READY) ? J1939_OK : J1939_BUSY;
 }
+
