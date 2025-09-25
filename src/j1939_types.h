@@ -32,38 +32,45 @@ typedef enum j1939_status {
   J1939_BLOCKED,
 } j1939_status_t;
 
-/* j1939 protocol data unit struct */
-typedef struct j1939_pdu {
+typedef union j1939_id {
   /* reference SAE J1939-21 5.2 */
-  uint32_t source_address : 8;
-  uint32_t pdu_specific   : 8;
-  uint32_t pdu_format     : 8;
-  uint32_t data_page      : 1;
-  uint32_t reserved       : 1;
-  uint32_t priority       : 3;
-  uint32_t err            : 1; /* error message frame */
-  uint32_t rtr            : 1; /* remote transmission request flag */
-  uint32_t eff            : 1; /* frame format flag */
-} j1939_pdu_t;
-
-/* j1939 message struct */
-typedef struct j1939_message {
-  union {
-    j1939_pdu_t pdu;
-    uint32_t id;
+  struct {
+    uint32_t source_address : 8;
+    uint32_t pdu_specific   : 8;
+    uint32_t pdu_format     : 8;
+    uint32_t data_page      : 1;
+    uint32_t ex_data_page   : 1;
+    uint32_t priority       : 3;
+    uint32_t err            : 1; /* error message frame */
+    uint32_t rtr            : 1; /* remote transmission request flag */
+    uint32_t eff            : 1; /* frame format flag */
   };
+  uint32_t u32;
+} j1939_id_t;
+
+typedef union j1939_pgn {
+  struct {
+    uint32_t pdu_specific   : 8;
+    uint32_t pdu_format     : 8;
+    uint32_t data_page      : 1;
+    uint32_t ex_data_page   : 1;
+  };
+  uint32_t u32;
+} j1939_pgn_t;
+
+/* j1939 protocol data unit (PDU) struct */
+typedef struct j1939_pdu {
+  j1939_id_t id;
   uint16_t size;
   uint8_t data[];
-} j1939_message_t;
+} j1939_pdu_t;
 
-typedef struct j1939_static_message {
-  union {
-    j1939_pdu_t pdu;
-    uint32_t id;
-  };
+/* static PDU */
+typedef struct j1939_spdu {
+  j1939_id_t id;
   uint16_t size;
   uint8_t data[J1939_SIZE_DATAFIELD];
-} j1939_static_message_t;
+} j1939_spdu_t;
 
 #ifdef __cplusplus
 }

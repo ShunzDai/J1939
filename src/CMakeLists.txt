@@ -1,6 +1,4 @@
 file(GLOB_RECURSE SOURCES_J1939 LIST_DIRECTORIES false
-  j1939_virtual.cpp
-  j1939_port.c
   j1939.c
 )
 
@@ -12,6 +10,6 @@ elseif(ESP_PLATFORM)
   target_link_libraries(j1939 PRIVATE idf::driver)
 endif()
 
-target_include_directories(j1939 PRIVATE
+target_include_directories(j1939 PUBLIC
   .
 )

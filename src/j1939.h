@@ -21,38 +21,44 @@ extern "C" {
 
 #include "j1939_types.h"
 
-typedef void (*j1939_cb_t)(j1939_port_t *port, const j1939_message_t *msg, void *arg);
+typedef void (*j1939_cb_t)(j1939_port_t *port, const j1939_pdu_t *msg);
+
+typedef j1939_status_t (*j1939_send_t)(j1939_port_t *self, const j1939_spdu_t *msg, uint32_t timeout_ms);
+typedef j1939_status_t (*j1939_read_t)(j1939_port_t *self, j1939_spdu_t *msg, uint32_t timeout_ms);
+typedef uint32_t (*j1939_tick_t)(j1939_port_t *self);
 
 typedef struct j1939_config {
   uint8_t self_address;
   j1939_cb_t recv_cb;
   j1939_cb_t timeout_cb;
+  j1939_send_t send;
+  j1939_read_t read;
+  j1939_tick_t tick;
   j1939_port_t *port;
-  void *arg;
 } j1939_config_t;
 
 typedef struct j1939 j1939_t;
 
-j1939_message_t *j1939_message_create(uint32_t id, const void *data, uint16_t size);
-void j1939_message_delete(j1939_message_t *msg);
+j1939_pdu_t *j1939_pdu_create(j1939_id_t id, const void *data, uint16_t size);
+void j1939_pdu_delete(j1939_pdu_t *msg);
 
 j1939_t *j1939_create(j1939_config_t *config);
 j1939_status_t j1939_delete(j1939_t *self);
 
 j1939_status_t j1939_status(j1939_t *self);
 
-j1939_status_t j1939_transmit(j1939_t *self, const j1939_message_t *msg, uint32_t timeout_ms);
+j1939_status_t j1939_transmit(j1939_t *self, const j1939_pdu_t *msg, uint32_t timeout_ms);
 
 j1939_status_t j1939_receive(j1939_t *self, uint32_t timeout_ms);
 
 j1939_status_t j1939_tp_cm_transmit_manager(j1939_t *self, uint32_t timeout_ms);
 
-static inline j1939_status_t j1939_transmit_static(j1939_t *self, const j1939_static_message_t *msg, uint32_t timeout_ms) {
-  return j1939_transmit(self, (const j1939_message_t *)msg, timeout_ms);
+static inline j1939_status_t j1939_transmit_static(j1939_t *self, const j1939_spdu_t *msg, uint32_t timeout_ms) {
+  return j1939_transmit(self, (const j1939_pdu_t *)msg, timeout_ms);
 }
 
-// static inline j1939_status_t j1939_receive_static(j1939_t *self, j1939_static_message_t *msg, uint32_t timeout_ms) {
-//   return j1939_receive(self, (j1939_message_t **)&msg, timeout_ms);
+// static inline j1939_status_t j1939_receive_static(j1939_t *self, j1939_spdu_t *msg, uint32_t timeout_ms) {
+//   return j1939_receive(self, (j1939_pdu_t **)&msg, timeout_ms);
 // }
 
 #ifdef __cplusplus

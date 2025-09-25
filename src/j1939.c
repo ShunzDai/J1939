@@ -14,10 +14,6 @@
   * limitations under the License.
   */
 #include "j1939.h"
-#include "j1939_port.h"
-#if defined J1939_PORT_VIRTUAL
-#include "j1939_virtual.h"
-#endif /* J1939_PORT_VIRTUAL */
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -174,13 +170,15 @@ struct j1939 {
   uint8_t packets_count;
   uint8_t response_packets;
   uint8_t abort_reason;
-  uint32_t tick;
+  uint32_t timeout;
   j1939_tp_status_t status;
   j1939_cb_t recv_cb;
   j1939_cb_t timeout_cb;
+  j1939_send_t send;
+  j1939_read_t read;
+  j1939_tick_t tick;
   j1939_port_t *port;
-  j1939_message_t *lmsg;
-  void *arg;
+  j1939_pdu_t *lmsg;
 };
 
 static inline uint8_t get_total_packets(uint16_t size) {
@@ -191,28 +189,35 @@ static inline uint8_t get_last_section(uint16_t size) {
   return (size % J1939_SIZE_PROTOCOL_PAYLOAD) ? (size % J1939_SIZE_PROTOCOL_PAYLOAD) : (J1939_SIZE_PROTOCOL_PAYLOAD);
 }
 
-uint32_t j1939_get_pgn(uint32_t pdu) {
+uint32_t j1939_get_pgn(j1939_id_t id) {
   /* Reference SAE J1939-21 5.1.2 */
-  return ((((j1939_pdu_t *)&pdu)->reserved << 17 | ((j1939_pdu_t *)&pdu)->data_page << 16) | (((j1939_pdu_t *)&pdu)->pdu_format < J1939_ADDRESS_DIVIDE)) ?
-         (((j1939_pdu_t *)&pdu)->pdu_format << 8) : (((j1939_pdu_t *)&pdu)->pdu_format << 8 | ((j1939_pdu_t *)&pdu)->pdu_specific);
+  j1939_pgn_t pgn = {0};
+  if (id.pdu_format >= J1939_ADDRESS_DIVIDE) {
+    pgn.pdu_specific = id.pdu_specific;
+  }
+  pgn.pdu_format = id.pdu_format;
+  pgn.data_page = id.data_page;
+  pgn.ex_data_page = id.ex_data_page;
+  return pgn.u32;
 }
 
-void j1939_set_pgn(uint32_t *pdu, const uint32_t pgn) {
+void j1939_set_pgn(j1939_id_t *id, uint32_t pgn) {
   /* Reference SAE J1939-21 5.1.2 */
-  ((j1939_pdu_t *)pdu)->reserved = (pgn >> 17) & 0x01;
-  ((j1939_pdu_t *)pdu)->data_page = (pgn >> 16) & 0x01;
-  ((j1939_pdu_t *)pdu)->pdu_format = (pgn >> 8) & 0xFF;
-  if (((j1939_pdu_t *)pdu)->pdu_format >= J1939_ADDRESS_DIVIDE)
-    ((j1939_pdu_t *)pdu)->pdu_specific = (pgn >> 0) & 0xFF;
+  if (((j1939_pgn_t *)&pgn)->pdu_format >= J1939_ADDRESS_DIVIDE) {
+    id->pdu_specific = ((j1939_pgn_t *)&pgn)->pdu_specific;
+  }
+  id->pdu_format = ((j1939_pgn_t *)&pgn)->pdu_format;
+  id->data_page = ((j1939_pgn_t *)&pgn)->data_page;
+  id->ex_data_page = ((j1939_pgn_t *)&pgn)->ex_data_page;
 }
 
 static j1939_status_t j1939_tp_cm_rts_transmit_manager(j1939_t *self, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
 
-  m.pdu.source_address = self->lmsg->pdu.source_address;
-  m.pdu.pdu_specific = self->lmsg->pdu.pdu_specific;
-  m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+  m.id.source_address = self->lmsg->id.source_address;
+  m.id.pdu_specific = self->lmsg->id.pdu_specific;
+  m.id.priority = J1939_TP_DEFAULT_PRIORITY;
   j1939_set_pgn(&m.id, J1939_PGN_TP_CM);
   ((j1939_rts_t *)m.data)->control = J1939_CONTROL_RTS;
   ((j1939_rts_t *)m.data)->message_size = self->lmsg->size;
@@ -220,39 +225,40 @@ static j1939_status_t j1939_tp_cm_rts_transmit_manager(j1939_t *self, uint32_t t
   ((j1939_rts_t *)m.data)->pgn = j1939_get_pgn(self->lmsg->id);
   ((j1939_rts_t *)m.data)->reserved = 0xFF;
 
-  if ((res = j1939_port_transmit(self->port, &m, timeout_ms)) == J1939_OK) {
+  if ((res = self->send(self->port, &m, timeout_ms)) == J1939_OK) {
     self->status = J1939_TP_CM_CTS_RX;
-    self->tick = j1939_port_get_tick();
+    self->timeout = self->tick(self->port);
   }
 
   return res;
 }
 
-static j1939_status_t j1939_tp_cm_rts_receive_manager(j1939_t *self, j1939_static_message_t *msg){
-  if (self->status != J1939_TP_READY)
+static j1939_status_t j1939_tp_cm_rts_receive_manager(j1939_t *self, j1939_spdu_t *msg){
+  if (self->status != J1939_TP_READY) {
     return J1939_ERROR;
-
-  self->lmsg = j1939_message_create(0, NULL, ((j1939_rts_t *)msg->data)->message_size);
-  self->lmsg->pdu.source_address = msg->pdu.source_address;
-  self->lmsg->pdu.pdu_specific = msg->pdu.pdu_specific;
+  }
+  j1939_id_t id = {0};
+  self->lmsg = j1939_pdu_create(id, NULL, ((j1939_rts_t *)msg->data)->message_size);
+  self->lmsg->id.source_address = msg->id.source_address;
+  self->lmsg->id.pdu_specific = msg->id.pdu_specific;
   j1939_set_pgn(&self->lmsg->id, ((j1939_rts_t *)msg->data)->pgn);
 
   self->total_packets = ((j1939_rts_t *)msg->data)->total_packets;
 
   self->status = J1939_TP_CM_CTS_TX;
 
-  self->tick = j1939_port_get_tick();
+  self->timeout = self->tick(self->port);
 
   return J1939_OK;
 }
 
 static j1939_status_t j1939_tp_cm_cts_transmit_manager(j1939_t *self) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
 
-  m.pdu.source_address = self->lmsg->pdu.pdu_specific;
-  m.pdu.pdu_specific = self->lmsg->pdu.source_address;
-  m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+  m.id.source_address = self->lmsg->id.pdu_specific;
+  m.id.pdu_specific = self->lmsg->id.source_address;
+  m.id.priority = J1939_TP_DEFAULT_PRIORITY;
   j1939_set_pgn(&m.id, J1939_PGN_TP_CM);
   ((j1939_cts_t *)m.data)->control = J1939_CONTROL_CTS;
   ((j1939_cts_t *)m.data)->next_sequence = self->packets_count + 1;
@@ -262,15 +268,15 @@ static j1939_status_t j1939_tp_cm_cts_transmit_manager(j1939_t *self) {
 
   self->response_packets = ((j1939_cts_t *)m.data)->response_packets;
 
-  if ((res = j1939_port_transmit(self->port, &m, J1939_TIMEOUT_TR)) == J1939_OK) {
+  if ((res = self->send(self->port, &m, J1939_TIMEOUT_TR)) == J1939_OK) {
     self->status = J1939_TP_DT_CMDT_RX;
-    self->tick = j1939_port_get_tick();
+    self->timeout = self->tick(self->port);
   }
 
   return res;
 }
 
-static j1939_status_t j1939_tp_cm_cts_receive_manager(j1939_t *self, j1939_static_message_t *msg) {
+static j1939_status_t j1939_tp_cm_cts_receive_manager(j1939_t *self, j1939_spdu_t *msg) {
   if (self->status != J1939_TP_CM_CTS_RX)
     return J1939_ERROR;
   else if (j1939_get_pgn(self->lmsg->id) != ((j1939_cts_t *)msg->data)->pgn)
@@ -282,18 +288,18 @@ static j1939_status_t j1939_tp_cm_cts_receive_manager(j1939_t *self, j1939_stati
 
   self->status = J1939_TP_DT_CMDT_TX;
 
-  self->tick = j1939_port_get_tick();
+  self->timeout = self->tick(self->port);
 
   return J1939_OK;
 }
 
 static j1939_status_t j1939_tp_cm_ack_transmit_manager(j1939_t *self) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
 
-  m.pdu.source_address = self->lmsg->pdu.pdu_specific;
-  m.pdu.pdu_specific = self->lmsg->pdu.source_address;
-  m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+  m.id.source_address = self->lmsg->id.pdu_specific;
+  m.id.pdu_specific = self->lmsg->id.source_address;
+  m.id.priority = J1939_TP_DEFAULT_PRIORITY;
   j1939_set_pgn(&m.id, J1939_PGN_TP_CM);
 
   ((j1939_ack_t *)m.data)->control = J1939_CONTROL_ACK;
@@ -302,15 +308,15 @@ static j1939_status_t j1939_tp_cm_ack_transmit_manager(j1939_t *self) {
   ((j1939_ack_t *)m.data)->reserved = 0xFF;
   ((j1939_ack_t *)m.data)->total_packets = self->total_packets;
 
-  if ((res = j1939_port_transmit(self->port, &m, J1939_TIMEOUT_TR)) == J1939_OK) {
+  if ((res = self->send(self->port, &m, J1939_TIMEOUT_TR)) == J1939_OK) {
     self->status = J1939_TP_COMPLETE_RX;
-    self->tick = j1939_port_get_tick();
+    self->timeout = self->tick(self->port);
   }
 
   return res;
 }
 
-static j1939_status_t j1939_tp_cm_ack_receive_manager(j1939_t *self, j1939_static_message_t *msg) {
+static j1939_status_t j1939_tp_cm_ack_receive_manager(j1939_t *self, j1939_spdu_t *msg) {
   if (self->status != J1939_TP_CM_ACK_RX)
     return J1939_ERROR;
   else if (j1939_get_pgn(self->lmsg->id) != ((j1939_ack_t *)msg->data)->pgn)
@@ -327,11 +333,11 @@ static j1939_status_t j1939_tp_cm_ack_receive_manager(j1939_t *self, j1939_stati
 
 static j1939_status_t j1939_tp_cm_bam_transmit_manager(j1939_t *self, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
 
-  m.pdu.source_address = self->lmsg->pdu.source_address;
-  m.pdu.pdu_specific = J1939_ADDRESS_GLOBAL;
-  m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+  m.id.source_address = self->lmsg->id.source_address;
+  m.id.pdu_specific = J1939_ADDRESS_GLOBAL;
+  m.id.priority = J1939_TP_DEFAULT_PRIORITY;
   j1939_set_pgn(&m.id, J1939_PGN_TP_CM);
   ((j1939_bam_t *)&m.data)->control = J1939_CONTROL_BAM;
   ((j1939_bam_t *)&m.data)->message_size = self->lmsg->size;
@@ -339,38 +345,39 @@ static j1939_status_t j1939_tp_cm_bam_transmit_manager(j1939_t *self, uint32_t t
   ((j1939_bam_t *)&m.data)->pgn = j1939_get_pgn(self->lmsg->id);
   ((j1939_bam_t *)&m.data)->reserved = 0xFF;
 
-  if ((res = j1939_port_transmit(self->port, &m, timeout_ms)) == J1939_OK) {
+  if ((res = self->send(self->port, &m, timeout_ms)) == J1939_OK) {
     self->status = J1939_TP_DT_BAM_TX;
-    self->tick = j1939_port_get_tick();
+    self->timeout = self->tick(self->port);
   }
 
   return res;
 }
 
-static j1939_status_t j1939_tp_cm_bam_receive_manager(j1939_t *self, j1939_static_message_t *msg) {
-  if (self->status != J1939_TP_READY)
+static j1939_status_t j1939_tp_cm_bam_receive_manager(j1939_t *self, j1939_spdu_t *msg) {
+  if (self->status != J1939_TP_READY) {
     return J1939_ERROR;
-
-  self->lmsg = j1939_message_create(0, NULL, ((j1939_bam_t *)msg->data)->message_size);
-  self->lmsg->pdu.source_address = msg->pdu.source_address;
-  self->lmsg->pdu.pdu_specific = msg->pdu.pdu_specific;
+  }
+  j1939_id_t id = {0};
+  self->lmsg = j1939_pdu_create(id, NULL, ((j1939_bam_t *)msg->data)->message_size);
+  self->lmsg->id.source_address = msg->id.source_address;
+  self->lmsg->id.pdu_specific = msg->id.pdu_specific;
   j1939_set_pgn(&self->lmsg->id, ((j1939_bam_t *)msg->data)->pgn);
 
   self->total_packets = ((j1939_bam_t *)msg->data)->total_packets;
 
   self->status = J1939_TP_DT_BAM_RX;
-  self->tick = j1939_port_get_tick();
+  self->timeout = self->tick(self->port);
 
   return J1939_OK;
 }
 
 // static j1939_status_t j1939_tp_cm_abort_transmit_manager(j1939_t *self, uint32_t timeout_ms) {
 //   j1939_status_t res = J1939_OK;
-//   j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+//   j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
 
-//   m.pdu.source_address = self->lmsg->pdu.pdu_specific;
-//   m.pdu.pdu_specific = self->lmsg->pdu.source_address;
-//   m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+//   m.id.source_address = self->lmsg->id.pdu_specific;
+//   m.id.pdu_specific = self->lmsg->id.source_address;
+//   m.id.priority = J1939_TP_DEFAULT_PRIORITY;
 //   j1939_set_pgn(&m.id, J1939_PGN_TP_CM);
 
 //   ((j1939_abort_t *)m.data)->control = J1939_CONTROL_ABORT;
@@ -378,33 +385,31 @@ static j1939_status_t j1939_tp_cm_bam_receive_manager(j1939_t *self, j1939_stati
 //   ((j1939_abort_t *)m.data)->reserved = 0xFFFFFF;
 //   ((j1939_abort_t *)m.data)->pgn = j1939_get_pgn(self->lmsg->id);
 
-//   if ((res = j1939_port_transmit(self->port, &m, timeout_ms)) == J1939_OK) {
+//   if ((res = self->send(self->port, &m, timeout_ms)) == J1939_OK) {
 //     self->status = J1939_TP_READY;
-//     self->tick = j1939_port_get_tick();
+//     self->timeout = self->tick(self->port);
 //   }
 
 //   return res;
 // }
 
-static j1939_status_t j1939_tp_cm_abort_receive_manager(j1939_t *self, j1939_static_message_t *msg){
-  if (j1939_get_pgn(self->lmsg->id) != ((j1939_abort_t *)msg->data)->pgn)
+static j1939_status_t j1939_tp_cm_abort_receive_manager(j1939_t *self, j1939_spdu_t *msg){
+  if (j1939_get_pgn(self->lmsg->id) != ((j1939_abort_t *)msg->data)->pgn) {
     return J1939_ERROR;
-
-  // J1939_MessageDelete(&self->lmsg);
-
-  memset(self, 0, sizeof(struct j1939));
-
+  }
+  j1939_pdu_delete(self->lmsg);
+  self->lmsg = NULL;
   return J1939_OK;
 }
 
 static j1939_status_t j1939_tp_dt_transmit_manager(j1939_t *self, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
   uint8_t section = J1939_SIZE_PROTOCOL_PAYLOAD;
 
-  m.pdu.source_address = self->lmsg->pdu.source_address;
-  m.pdu.pdu_specific = self->status == J1939_TP_DT_BAM_TX ? J1939_ADDRESS_GLOBAL : self->lmsg->pdu.pdu_specific;
-  m.pdu.priority = J1939_TP_DEFAULT_PRIORITY;
+  m.id.source_address = self->lmsg->id.source_address;
+  m.id.pdu_specific = self->status == J1939_TP_DT_BAM_TX ? J1939_ADDRESS_GLOBAL : self->lmsg->id.pdu_specific;
+  m.id.priority = J1939_TP_DEFAULT_PRIORITY;
   j1939_set_pgn(&m.id, J1939_PGN_TP_DT);
 
   if (self->packets_count + 1 == self->total_packets) {
@@ -415,7 +420,7 @@ static j1939_status_t j1939_tp_dt_transmit_manager(j1939_t *self, uint32_t timeo
   m.data[0] = self->packets_count + 1;
   memcpy(&m.data[1], self->lmsg->data + self->packets_count * J1939_SIZE_PROTOCOL_PAYLOAD, section);
 
-  if ((res = j1939_port_transmit(self->port, &m, timeout_ms)) == J1939_OK) {
+  if ((res = self->send(self->port, &m, timeout_ms)) == J1939_OK) {
     self->packets_count += 1;
     switch (self->status) {
       case J1939_TP_DT_BAM_TX:
@@ -431,13 +436,13 @@ static j1939_status_t j1939_tp_dt_transmit_manager(j1939_t *self, uint32_t timeo
       default:
         break;
     }
-    self->tick = j1939_port_get_tick();
+    self->timeout = self->tick(self->port);
   }
 
   return res;
 }
 
-static j1939_status_t j1939_tp_dt_receive_manager(j1939_t *self, j1939_static_message_t *msg) {
+static j1939_status_t j1939_tp_dt_receive_manager(j1939_t *self, j1939_spdu_t *msg) {
   uint8_t section = J1939_SIZE_PROTOCOL_PAYLOAD;
 
   if (self->packets_count + 1 != msg->data[0]) {
@@ -465,13 +470,13 @@ static j1939_status_t j1939_tp_dt_receive_manager(j1939_t *self, j1939_static_me
 
   memcpy(self->lmsg->data + (self->packets_count - 1) * J1939_SIZE_PROTOCOL_PAYLOAD, &msg->data[1], section);
 
-  self->tick = j1939_port_get_tick();
+  self->timeout = self->tick(self->port);
 
   return J1939_OK;
 }
 
 static j1939_status_t j1939_tp_dt_bam_transmit_manager(j1939_t *self) {
-  return j1939_port_get_tick() - self->tick < J1939_TP_BAM_TX_INTERVAL ? J1939_BLOCKED : j1939_tp_dt_transmit_manager(self, J1939_TIMEOUT_TR);
+  return self->tick(self->port) - self->timeout < J1939_TP_BAM_TX_INTERVAL ? J1939_BLOCKED : j1939_tp_dt_transmit_manager(self, J1939_TIMEOUT_TR);
 }
 
 static j1939_status_t j1939_tp_dt_cmdt_transmit_manager(j1939_t *self) {
@@ -479,7 +484,7 @@ static j1939_status_t j1939_tp_dt_cmdt_transmit_manager(j1939_t *self) {
 }
 
 j1939_status_t j1939_tp_cm_transmit_helper(j1939_t *self, uint32_t timeout_ms, j1939_status_t (*func)(j1939_t *)) {
-  return j1939_port_get_tick() - self->tick < timeout_ms ? func(self) : J1939_TIMEOUT;
+  return self->tick(self->port) - self->timeout < timeout_ms ? func(self) : J1939_TIMEOUT;
 }
 
 j1939_status_t j1939_tp_cm_transmit_manager(j1939_t *self, uint32_t timeout_ms) {
@@ -501,7 +506,7 @@ j1939_status_t j1939_tp_cm_transmit_manager(j1939_t *self, uint32_t timeout_ms) 
   return res;
 }
 
-static j1939_status_t j1939_tp_cm_receive_manager(j1939_t *self, j1939_static_message_t *msg) {
+static j1939_status_t j1939_tp_cm_receive_manager(j1939_t *self, j1939_spdu_t *msg) {
   j1939_status_t res = J1939_OK;
   switch ((j1939_control_t)msg->data[0]) {
     case J1939_CONTROL_RTS:
@@ -525,27 +530,33 @@ static j1939_status_t j1939_tp_cm_receive_manager(j1939_t *self, j1939_static_me
   return res;
 }
 
-j1939_status_t j1939_receive_filter(j1939_t *self, const j1939_message_t *msg) {
+j1939_status_t j1939_receive_filter(j1939_t *self, const j1939_pdu_t *msg) {
   j1939_status_t res = J1939_OK;
   /* pdu1 filter */
-  if (msg->pdu.pdu_format < J1939_ADDRESS_DIVIDE) {
-    if (msg->pdu.pdu_specific != self->self_address && msg->pdu.pdu_specific != J1939_ADDRESS_GLOBAL)
+  if (msg->id.pdu_format < J1939_ADDRESS_DIVIDE) {
+    if (msg->id.pdu_specific != self->self_address && msg->id.pdu_specific != J1939_ADDRESS_GLOBAL)
       res = J1939_ERROR;
   }
   return res;
 }
 
-j1939_message_t *j1939_message_create(uint32_t id, const void *data, uint16_t size) {
-  if (size > J1939_TP_MAX_MSG_SIZE)
+j1939_pdu_t *j1939_pdu_create(j1939_id_t id, const void *data, uint16_t size) {
+  if (size > J1939_TP_MAX_MSG_SIZE) {
     return NULL;
-  j1939_message_t *self = (j1939_message_t *)malloc(sizeof(j1939_message_t) + size);
+  }
+  j1939_pdu_t *self = (j1939_pdu_t *)malloc(sizeof(j1939_pdu_t) + size);
   self->id = id;
   self->size = size;
-  data ? memcpy(self->data, data, size) : memset(self->data, 0, size);
+  if (data) {
+    memcpy(self->data, data, size);
+  }
+  else {
+    memset(self->data, 0, size);
+  }
   return self;
 }
 
-void j1939_message_delete(j1939_message_t *msg) {
+void j1939_pdu_delete(j1939_pdu_t *msg) {
   free(msg);
 }
 
@@ -555,45 +566,56 @@ j1939_t *j1939_create(j1939_config_t *config) {
   self->self_address = config->self_address;
   self->recv_cb = config->recv_cb;
   self->timeout_cb = config->timeout_cb;
-  self->arg = config->arg;
-  #if defined J1939_PORT_VIRTUAL
-  j1939_virtual_add_node(self->port);
-  #endif /* J1939_PORT_VIRTUAL */
+  self->send = config->send;
+  self->read = config->read;
+  self->tick = config->tick;
   return self;
 }
 
 j1939_status_t j1939_delete(j1939_t *self) {
-  if (self->lmsg)
-    j1939_message_delete(self->lmsg);
-
+  if (self->lmsg) {
+    j1939_pdu_delete(self->lmsg);
+    self->lmsg = NULL;
+  }
   free(self);
   return J1939_OK;
 }
 
-j1939_status_t j1939_transmit(j1939_t *self, const j1939_message_t *msg, uint32_t timeout_ms) {
+j1939_status_t j1939_transmit(j1939_t *self, const j1939_pdu_t *msg, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  if (self->status >= J1939_TP_COMPLETE_RX /*!= J1939_TP_READY*/)
+  if (self->status > J1939_TP_CM_ABORT_TX) {
     res = J1939_BUSY;
-  else if (msg->size > J1939_TP_MAX_MSG_SIZE)
+  }
+  else if (msg->size > J1939_TP_MAX_MSG_SIZE) {
     res = J1939_ERROR;
+  }
   else if (msg->size > J1939_SIZE_DATAFIELD) {
-    self->lmsg = (j1939_message_t *)msg;
+    self->lmsg = (j1939_pdu_t *)msg;
     self->total_packets = get_total_packets(msg->size);
     self->packets_count = 0;
-    if (msg->pdu.pdu_format < J1939_ADDRESS_DIVIDE)
+    if (msg->id.pdu_format < J1939_ADDRESS_DIVIDE) {
       res = j1939_tp_cm_rts_transmit_manager(self, timeout_ms);
-    else
+    }
+    else {
       res = j1939_tp_cm_bam_transmit_manager(self, timeout_ms);
+    }
   }
-  else
-    res = j1939_port_transmit(self->port, (const j1939_static_message_t *)msg, timeout_ms);
+  else {
+    res = self->send(self->port, (j1939_spdu_t *)msg, timeout_ms);
+  }
   return res;
 }
 
 j1939_status_t j1939_receive(j1939_t *self, uint32_t timeout_ms) {
   j1939_status_t res = J1939_OK;
-  j1939_static_message_t m = { .size = J1939_SIZE_DATAFIELD, };
-  if ((res = j1939_port_receive(self->port, &m, timeout_ms)) == J1939_OK && (res = j1939_receive_filter(self, (j1939_message_t *)&m)) == J1939_OK) {
+  j1939_spdu_t m = { .size = J1939_SIZE_DATAFIELD, };
+  if ((res = self->read(self->port, &m, timeout_ms)) != J1939_OK) {
+
+  }
+  else if ((res = j1939_receive_filter(self, (j1939_pdu_t *)&m)) != J1939_OK) {
+
+  } 
+  else {
     switch (j1939_get_pgn(m.id)) {
       case J1939_PGN_TP_CM:
         j1939_tp_cm_receive_manager(self, &m);
@@ -601,12 +623,12 @@ j1939_status_t j1939_receive(j1939_t *self, uint32_t timeout_ms) {
       case J1939_PGN_TP_DT:
         j1939_tp_dt_receive_manager(self, &m);
         if (self->status == J1939_TP_COMPLETE_RX) {
-          self->recv_cb(self->port, self->lmsg, self->arg);
+          self->recv_cb(self->port, self->lmsg);
           self->status = J1939_TP_READY;
         }
         break;
       default:
-        self->recv_cb(self->port, (j1939_message_t *)&m, self->arg);
+        self->recv_cb(self->port, (j1939_pdu_t *)&m);
         break;
     }
   }
