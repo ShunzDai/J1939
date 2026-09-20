@@ -41,6 +41,10 @@ typedef struct j1939_config {
 
 typedef struct j1939 j1939_t;
 
+j1939_pgn_t j1939_get_pgn(j1939_id_t id);
+
+void j1939_set_pgn(j1939_id_t *id, j1939_pgn_t pgn);
+
 j1939_pdu_t *j1939_pdu_create(j1939_id_t id, const void *data, uint16_t size);
 
 void j1939_pdu_delete(j1939_pdu_t *msg);
